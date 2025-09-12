@@ -1,86 +1,148 @@
-from typing import List, Optional, Dict, Any
-import uuid
-from datetime import datetime
 import os
+import uuid
+import logging
+from typing import List, Optional
+from datetime import datetime, timezone
+from pathlib import Path
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update, delete
+from ..models.database_models import KnowledgeBase, KnowledgeBaseStatus, User
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..models.database_models import KnowledgeBase as KnowledgeBaseModel
+else:
+    KnowledgeBaseModel = KnowledgeBase
+from app.config import settings
 import shutil
-from ..models.knowledge_base import KnowledgeBase, KnowledgeBaseCreate, KnowledgeBaseUpdate, KnowledgeBaseStatus
+import re
+
+def secure_filename(filename):
+    """Make a filename safe for use"""
+    if not filename:
+        return 'unnamed'
+    # Remove path separators and dangerous characters
+    filename = re.sub(r'[^\w\s.-]', '', filename)
+    # Replace spaces with underscores
+    filename = re.sub(r'\s+', '_', filename)
+    # Remove leading/trailing dots and spaces
+    filename = filename.strip('. ')
+    return filename or 'unnamed'
+
+logger = logging.getLogger(__name__)
 
 class KnowledgeBaseService:
-    def __init__(self, base_dir: str = "./knowledge_bases"):
-        self.base_dir = base_dir
-        self.knowledge_bases: Dict[str, KnowledgeBase] = {}
-        os.makedirs(base_dir, exist_ok=True)
+    def __init__(self, db: AsyncSession):
+        self.db = db
+        self._ensure_base_directory()
     
-    async def create_knowledge_base(self, request: KnowledgeBaseCreate) -> KnowledgeBase:
+    def _ensure_base_directory(self):
+        """确保基础目录存在"""
+        try:
+            base_dir = Path(settings.upload_base_dir)
+            base_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 创建知识库根目录
+            kb_root = base_dir / "knowledge_bases"
+            kb_root.mkdir(exist_ok=True)
+        except (OSError, PermissionError) as e:
+            logger.error(f"Failed to create base directory: {e}")
+            raise
+
+    async def create_knowledge_base(self, name: str, description: str = None, owner_id: str = "admin-001") -> KnowledgeBaseModel:
         """创建知识库"""
         kb_id = str(uuid.uuid4())
-        now = datetime.now()
         
-        # 创建知识库目录
-        kb_dir = os.path.join(self.base_dir, kb_id)
-        os.makedirs(kb_dir, exist_ok=True)
-        os.makedirs(os.path.join(kb_dir, "documents"), exist_ok=True)
-        os.makedirs(os.path.join(kb_dir, "vectors"), exist_ok=True)
+        # 安全地创建知识库目录
+        safe_kb_id = secure_filename(kb_id)
+        kb_dir = Path(settings.upload_base_dir) / "knowledge_bases" / safe_kb_id
         
+        try:
+            kb_dir.mkdir(parents=True, exist_ok=True)
+            (kb_dir / "documents").mkdir(exist_ok=True)
+        except (OSError, PermissionError) as e:
+            logger.error(f"Failed to create knowledge base directory: {e}")
+            raise
+        
+        now = datetime.now(timezone.utc)
         knowledge_base = KnowledgeBase(
             id=kb_id,
-            name=request.name,
-            description=request.description,
-            owner=request.owner,
-            status=KnowledgeBaseStatus.ACTIVE,
-            document_count=0,
+            name=name,
+            description=description,
+            owner_id=owner_id,
+            status='active',
             created_at=now,
             updated_at=now
         )
         
-        self.knowledge_bases[kb_id] = knowledge_base
+        self.db.add(knowledge_base)
+        await self.db.commit()
+        await self.db.refresh(knowledge_base)
         return knowledge_base
-    
-    async def get_knowledge_base(self, kb_id: str) -> Optional[KnowledgeBase]:
-        """获取知识库"""
-        return self.knowledge_bases.get(kb_id)
-    
-    async def list_knowledge_bases(self, status: Optional[KnowledgeBaseStatus] = None) -> List[KnowledgeBase]:
-        """列出知识库"""
-        bases = list(self.knowledge_bases.values())
-        if status:
-            bases = [kb for kb in bases if kb.status == status]
-        return sorted(bases, key=lambda x: x.created_at, reverse=True)
-    
-    async def update_knowledge_base(self, kb_id: str, request: KnowledgeBaseUpdate) -> Optional[KnowledgeBase]:
+
+    async def get_knowledge_bases(self) -> List[KnowledgeBaseModel]:
+        """获取所有知识库（不包括已归档的）"""
+        result = await self.db.execute(
+            select(KnowledgeBase).where(KnowledgeBase.status != 'archived')
+        )
+        return result.scalars().all()
+
+    async def get_knowledge_base(self, kb_id: str) -> Optional[KnowledgeBaseModel]:
+        """获取单个知识库"""
+        result = await self.db.execute(select(KnowledgeBase).where(KnowledgeBase.id == kb_id))
+        return result.scalar_one_or_none()
+
+    async def update_knowledge_base(self, kb_id: str, name: str = None, description: str = None) -> Optional[KnowledgeBaseModel]:
         """更新知识库"""
-        if kb_id not in self.knowledge_bases:
+        stmt = update(KnowledgeBase).where(KnowledgeBase.id == kb_id)
+        update_data = {"updated_at": datetime.now(timezone.utc)}
+        
+        if name is not None:
+            update_data["name"] = name
+        if description is not None:
+            update_data["description"] = description
+        
+        stmt = stmt.values(**update_data)
+        result = await self.db.execute(stmt)
+        
+        if result.rowcount == 0:
             return None
         
-        kb = self.knowledge_bases[kb_id]
-        
-        if request.name is not None:
-            kb.name = request.name
-        if request.description is not None:
-            kb.description = request.description
-        if request.owner is not None:
-            kb.owner = request.owner
-        if request.status is not None:
-            kb.status = request.status
-        
-        kb.updated_at = datetime.now()
-        return kb
-    
-    async def delete_knowledge_base(self, kb_id: str, soft_delete: bool = True) -> bool:
+        await self.db.commit()
+        return await self.get_knowledge_base(kb_id)
+
+    async def delete_knowledge_base(self, kb_id: str, hard_delete: bool = False) -> bool:
         """删除知识库"""
-        if kb_id not in self.knowledge_bases:
+        knowledge_base = await self.get_knowledge_base(kb_id)
+        if not knowledge_base:
             return False
         
-        if soft_delete:
-            # 软删除：只标记状态
-            kb = self.knowledge_bases[kb_id]
-            kb.status = KnowledgeBaseStatus.DELETED
-            kb.updated_at = datetime.now()
-        else:
-            # 硬删除：删除文件和记录
-            kb_dir = os.path.join(self.base_dir, kb_id)
-            if os.path.exists(kb_dir):
-                shutil.rmtree(kb_dir)
-            del self.knowledge_bases[kb_id]
-        
-        return True
+        try:
+            if hard_delete:
+                # 物理删除：先删除目录，再删除数据库记录
+                safe_kb_id = secure_filename(kb_id)
+                kb_dir = Path(settings.upload_base_dir) / "knowledge_bases" / safe_kb_id
+                
+                try:
+                    if kb_dir.exists():
+                        shutil.rmtree(kb_dir)
+                except (OSError, PermissionError) as e:
+                    logger.error(f"Failed to delete knowledge base directory: {e}")
+                    # 继续删除数据库记录
+                
+                # 删除知识库（级联删除会自动删除相关文档）
+                await self.db.execute(delete(KnowledgeBase).where(KnowledgeBase.id == kb_id))
+            else:
+                # 软删除：标记为已归档
+                stmt = update(KnowledgeBase).where(KnowledgeBase.id == kb_id).values(
+                    status='archived',
+                    updated_at=datetime.now(timezone.utc)
+                )
+                await self.db.execute(stmt)
+            
+            await self.db.commit()
+            return True
+            
+        except Exception as e:
+            await self.db.rollback()
+            raise

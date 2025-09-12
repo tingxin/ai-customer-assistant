@@ -57,12 +57,22 @@ class ChatService:
             ]
         }
     
-    def get_random_response(self) -> Dict[str, Any]:
-        # 随机选择响应类型：30%文本，30%图片，20%卡片，20%列表
-        response_type = random.choices(
-            ["text", "image", "card", "list"],
-            weights=[30, 30, 20, 20]
-        )[0]
+    def get_random_response(self, user_message: str = "") -> Dict[str, Any]:
+        # 根据用户输入的关键词返回特定类型的消息
+        user_message_lower = user_message.lower()
+        
+        if "卡片" in user_message_lower or "card" in user_message_lower:
+            response_type = "card"
+        elif "列表" in user_message_lower or "list" in user_message_lower:
+            response_type = "list"
+        elif "图片" in user_message_lower or "image" in user_message_lower:
+            response_type = "image"
+        else:
+            # 随机选择响应类型：30%文本，30%图片，20%卡片，20%列表
+            response_type = random.choices(
+                ["text", "image", "card", "list"],
+                weights=[30, 30, 20, 20]
+            )[0]
         
         content = random.choice(self.demo_responses[response_type])
         
